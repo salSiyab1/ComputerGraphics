@@ -1,4 +1,6 @@
-import java.io.PrintWriter;
+import java.awt.image.BufferedImage;
+import java.io.File;
+import javax.imageio.ImageIO;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -364,24 +366,6 @@ public class RayTracer {
         }
     }
 
-    // Write a color to output (with gamma correction)
-    public static void writeColor(PrintWriter out, Vec3 pixelColor, int samplesPerPixel) {
-        double r = pixelColor.x;
-        double g = pixelColor.y;
-        double b = pixelColor.z;
-
-        double scale = 1.0 / samplesPerPixel;
-        r = Math.sqrt(scale * r);
-        g = Math.sqrt(scale * g);
-        b = Math.sqrt(scale * b);
-
-        int ir = (int)(256 * clamp(r, 0.0, 0.999));
-        int ig = (int)(256 * clamp(g, 0.0, 0.999));
-        int ib = (int)(256 * clamp(b, 0.0, 0.999));
-
-        out.println(ir + " " + ig + " " + ib);
-    }
-
     // Recursive function to compute the ray's color.
     public static Vec3 rayColor(Ray r, Hittable world, int depth) {
         if (depth <= 0)
@@ -405,7 +389,7 @@ public class RayTracer {
     public static void main(String[] args) throws Exception {
         // Image parameters
         double aspectRatio = 16.0 / 9.0;
-        int imageWidth = 1980;
+        int imageWidth = 1200;
         int imageHeight = (int)(imageWidth / aspectRatio);
         int samplesPerPixel = 100;
         int maxDepth = 50;
@@ -458,12 +442,10 @@ public class RayTracer {
         double aperture = 0.1;
         Camera cam = new Camera(lookfrom, lookat, vup, 20, aspectRatio, aperture, distToFocus);
 
-        // Render: output image to PPM file.
-        PrintWriter out = new PrintWriter("image.ppm");
-        out.println("P3");
-        out.println(imageWidth + " " + imageHeight);
-        out.println("255");
+        // Create a BufferedImage to store the rendered image.
+        BufferedImage image = new BufferedImage(imageWidth, imageHeight, BufferedImage.TYPE_INT_RGB);
 
+        // Render loop: for each pixel, sample multiple rays for anti-aliasing.
         for (int j = imageHeight - 1; j >= 0; j--) {
             System.err.println("Scanlines remaining: " + j);
             for (int i = 0; i < imageWidth; i++) {
@@ -474,10 +456,27 @@ public class RayTracer {
                     Ray r = cam.getRay(u, v);
                     pixelColor = pixelColor.add(rayColor(r, world, maxDepth));
                 }
-                writeColor(out, pixelColor, samplesPerPixel);
+
+                // Convert the pixel's color to [0, 255] with gamma correction.
+                double scale = 1.0 / samplesPerPixel;
+                double r = Math.sqrt(scale * pixelColor.x);
+                double g = Math.sqrt(scale * pixelColor.y);
+                double b = Math.sqrt(scale * pixelColor.z);
+
+                int ir = (int)(256 * clamp(r, 0.0, 0.999));
+                int ig = (int)(256 * clamp(g, 0.0, 0.999));
+                int ib = (int)(256 * clamp(b, 0.0, 0.999));
+
+                // Compose the RGB value and set it in the BufferedImage.
+                int rgb = (ir << 16) | (ig << 8) | ib;
+                // Note: image coordinate y is inverted relative to our loop.
+                image.setRGB(i, imageHeight - j - 1, rgb);
             }
         }
-        out.close();
-        System.err.println("Done.");
+        System.err.println("Done rendering.");
+
+        // Write the image as a JPEG file.
+        ImageIO.write(image, "jpg", new File("image.jpg"));
+        System.err.println("Image saved as image.jpg");
     }
 }
