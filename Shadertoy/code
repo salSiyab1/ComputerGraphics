@@ -1,0 +1,371 @@
+#ifdef GL_ES
+precision highp float;
+#endif
+
+//------------------------------------------------------
+// 1) STABLE RANDOM FOR SCENE GENERATION
+//------------------------------------------------------
+/*
+  We want each small sphere to have a stable position/material
+  that does not change every frame. So we define a deterministic
+  hash function based on integer coordinates (a,b).
+*/
+
+// A simple float hash
+float stableHash(float n) {
+    // You can tweak constants for variety
+    return fract(sin(n) * 43758.5453123);
+}
+
+// Returns two stable random numbers in [0,1], given a cell (a,b) + offset
+vec2 stableRand2(ivec2 cell, float offset) {
+    // Combine cell.x, cell.y, offset into one float
+    float n = float(cell.x)*133.3 + float(cell.y)*311.7 + offset*17.123;
+    return vec2(
+        stableHash(n + 1.0),
+        stableHash(n + 2.0)
+    );
+}
+
+// Returns one stable random number in [0,1], given a cell (a,b) + offset
+float stableRand(ivec2 cell, float offset) {
+    return stableRand2(cell, offset).x;
+}
+
+//------------------------------------------------------
+// 2) RUNTIME RANDOM FOR RAY SCATTERING
+//------------------------------------------------------
+/*
+  These functions use a per-pixel seed for path tracing (bounces),
+  but NOT for scene generation. That way the scene is stable.
+*/
+float hashVal(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+}
+
+// A simple random generator using a mutable seed
+float rnd(inout vec2 seed) {
+    float r = hashVal(seed);
+    seed += vec2(1.0);
+    return r;
+}
+
+// Random point in a unit sphere (for diffuse bounces, metals fuzz)
+vec3 random_in_unit_sphere(inout vec2 seed) {
+    vec3 p;
+    // limit to 10 tries to avoid infinite loops
+    for(int i=0; i<10; i++) {
+        p = 2.0 * vec3(rnd(seed), rnd(seed), rnd(seed)) - vec3(1.0);
+        if(dot(p, p) < 1.0) break;
+    }
+    return p;
+}
+
+// Random unit vector
+vec3 random_unit_vector(inout vec2 seed) {
+    return normalize(random_in_unit_sphere(seed));
+}
+
+// Random point in a unit disk (for depth-of-field)
+vec2 random_in_unit_disk(inout vec2 seed) {
+    vec2 p;
+    for(int i=0; i<10; i++) {
+        p = 2.0 * vec2(rnd(seed), rnd(seed)) - vec2(1.0);
+        if(dot(p,p) < 1.0) break;
+    }
+    return p;
+}
+
+//------------------------------------------------------
+// 3) RENAME BUILT-IN REFLECT/REFRACT TO AVOID GLSL CONFLICT
+//------------------------------------------------------
+vec3 myReflect(vec3 v, vec3 n) {
+    return v - 2.0 * dot(v, n) * n;
+}
+vec3 myRefract(vec3 uv, vec3 n, float etai_over_etat) {
+    float cosTheta = min(dot(-uv, n), 1.0);
+    vec3 rOutPerp = etai_over_etat * (uv + cosTheta * n);
+    vec3 rOutParallel = -n * sqrt(abs(1.0 - dot(rOutPerp, rOutPerp)));
+    return rOutPerp + rOutParallel;
+}
+
+//------------------------------------------------------
+// 4) SCENE STRUCTS & RAY-SPHERE INTERSECTION
+//------------------------------------------------------
+struct HitRecord {
+    float t;
+    vec3 p;
+    vec3 normal;
+    int  matType;   // 0: Lambertian, 1: Metal, 2: Dielectric
+    vec3 albedo;    // used by Lambertian & Metal
+    float fuzz;     // used by Metal
+    float ir;       // index of refraction for Dielectric
+};
+
+bool hitSphere(vec3 ro, vec3 rd, vec3 center, float radius,
+               out float tHit, out vec3 normal)
+{
+    vec3 oc = ro - center;
+    float a = dot(rd, rd);
+    float half_b = dot(oc, rd);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = half_b * half_b - a * c;
+    if(discriminant < 0.0) return false;
+
+    float sqrtd = sqrt(discriminant);
+    float t = (-half_b - sqrtd) / a;
+    if(t < 0.001) {
+        t = (-half_b + sqrtd) / a;
+        if(t < 0.001) return false;
+    }
+
+    tHit = t;
+    vec3 p = ro + t * rd;
+    normal = normalize(p - center);
+    return true;
+}
+
+//------------------------------------------------------
+// 5) BUILDING THE SCENE (GROUND + 3 BIG SPHERES + SMALL ONES)
+//------------------------------------------------------
+bool sceneHit(vec3 ro, vec3 rd, out HitRecord rec) {
+    bool hitAnything = false;
+    float closest = 1e20;
+    HitRecord temp;
+
+    // 5.1) The ground (huge sphere)
+    {
+        float tHit; vec3 n;
+        if(hitSphere(ro, rd, vec3(0.0, -1000.0, 0.0), 1000.0, tHit, n)) {
+            if(tHit < closest) {
+                closest = tHit;
+                temp.t = tHit;
+                temp.p = ro + tHit * rd;
+                temp.normal = n;
+                temp.matType = 0;  // Lambertian
+                temp.albedo = vec3(0.5); // grey
+            }
+            hitAnything = true;
+        }
+    }
+
+    // 5.2) Three large spheres
+    {
+        float tHit; vec3 n;
+        // (A) Dielectric (center)
+        if(hitSphere(ro, rd, vec3(0.0, 1.0, 0.0), 1.0, tHit, n)) {
+            if(tHit < closest) {
+                closest = tHit;
+                temp.t = tHit;
+                temp.p = ro + tHit * rd;
+                temp.normal = n;
+                temp.matType = 2; // Dielectric
+                temp.ir = 1.5;
+            }
+            hitAnything = true;
+        }
+        // (B) Lambertian (left)
+        if(hitSphere(ro, rd, vec3(-4.0, 1.0, 0.0), 1.0, tHit, n)) {
+            if(tHit < closest) {
+                closest = tHit;
+                temp.t = tHit;
+                temp.p = ro + tHit * rd;
+                temp.normal = n;
+                temp.matType = 0; // Lambertian
+                temp.albedo = vec3(0.4, 0.2, 0.1);
+            }
+            hitAnything = true;
+        }
+        // (C) Metal (right)
+        if(hitSphere(ro, rd, vec3(4.0, 1.0, 0.0), 1.0, tHit, n)) {
+            if(tHit < closest) {
+                closest = tHit;
+                temp.t = tHit;
+                temp.p = ro + tHit * rd;
+                temp.normal = n;
+                temp.matType = 1; // Metal
+                temp.albedo = vec3(0.7, 0.6, 0.5);
+                temp.fuzz = 0.0;
+            }
+            hitAnything = true;
+        }
+    }
+
+    // 5.3) Grid of small spheres ([-6..6], ~13x13 = 169 spheres)
+    for(int a = -6; a <= 6; a++) {
+        for(int b = -6; b <= 6; b++) {
+            // stable random for each cell
+            vec2 r2pos   = stableRand2(ivec2(a, b), 0.0);
+            float rx     = r2pos.x;
+            float rz     = r2pos.y;
+            vec3 center  = vec3(float(a) + 0.9*rx, 0.2, float(b) + 0.9*rz);
+
+            // skip if too close to big metal sphere
+            if(length(center - vec3(4.0, 0.2, 0.0)) > 0.9) {
+                float tHit; vec3 n;
+                if(hitSphere(ro, rd, center, 0.2, tHit, n)) {
+                    if(tHit < closest) {
+                        closest = tHit;
+                        temp.t = tHit;
+                        temp.p = ro + tHit * rd;
+                        temp.normal = n;
+
+                        float chooseMat = stableRand(ivec2(a,b), 1.0);
+                        if(chooseMat < 0.8) {
+                            // Lambertian
+                            temp.matType = 0;
+                            // random color
+                            vec2 r2color1 = stableRand2(ivec2(a,b), 2.0);
+                            vec2 r2color2 = stableRand2(ivec2(a,b), 3.0);
+                            float rcol = r2color1.x * r2color1.y; 
+                            float gcol = r2color2.x * r2color2.y;
+                            float bcol = stableRand(ivec2(a,b), 4.0)*stableRand(ivec2(a,b), 5.0);
+                            temp.albedo = vec3(rcol, gcol, bcol);
+                        }
+                        else if(chooseMat < 0.95) {
+                            // Metal
+                            temp.matType = 1;
+                            vec2 rm = stableRand2(ivec2(a,b), 6.0);
+                            temp.albedo = vec3(0.5+0.5*rm.x, 0.5+0.5*rm.y, 0.5+0.5*stableRand(ivec2(a,b), 7.0));
+                            temp.fuzz   = 0.5 * stableRand(ivec2(a,b), 8.0);
+                        }
+                        else {
+                            // Dielectric
+                            temp.matType = 2;
+                            temp.ir = 1.5;
+                        }
+                    }
+                    hitAnything = true;
+                }
+            }
+        }
+    }
+
+    if(hitAnything) {
+        rec = temp;
+    }
+    return hitAnything;
+}
+
+//------------------------------------------------------
+// 6) BACKGROUND & RAYCOLOR
+//------------------------------------------------------
+vec3 background(vec3 rd) {
+    vec3 unitDir = normalize(rd);
+    float t = 0.5 * (unitDir.y + 1.0);
+    return mix(vec3(1.0), vec3(0.5, 0.7, 1.0), t);
+}
+
+// Iterative path tracer (up to MAX_BOUNCES)
+vec3 rayColor(vec3 ro, vec3 rd, inout vec2 seed) {
+    vec3 col = vec3(1.0);
+    const int MAX_BOUNCES = 10;
+
+    for(int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
+        HitRecord rec;
+        if(sceneHit(ro, rd, rec)) {
+            if(rec.matType == 0) {
+                // Lambertian
+                vec3 target = rec.p + rec.normal + random_unit_vector(seed);
+                col *= rec.albedo;
+                rd = normalize(target - rec.p);
+            }
+            else if(rec.matType == 1) {
+                // Metal
+                vec3 reflected = myReflect(normalize(rd), rec.normal);
+                rd = reflected + rec.fuzz * random_in_unit_sphere(seed);
+                col *= rec.albedo;
+                if(dot(rd, rec.normal) <= 0.0) {
+                    col = vec3(0.0);
+                    break;
+                }
+            }
+            else {
+                // Dielectric
+                float refractionRatio = (dot(rd, rec.normal) < 0.0) ? (1.0 / rec.ir) : rec.ir;
+                vec3 unitDir = normalize(rd);
+                float cosTheta = min(dot(-unitDir, rec.normal), 1.0);
+                float sinTheta = sqrt(1.0 - cosTheta*cosTheta);
+                bool cannotRefract = (refractionRatio * sinTheta > 1.0);
+
+                // Schlick approx
+                float reflectProb = mix(0.0, 1.0, pow((1.0 - cosTheta), 5.0));
+                if(cannotRefract || reflectProb > rnd(seed)) {
+                    rd = myReflect(unitDir, rec.normal);
+                } else {
+                    rd = myRefract(unitDir, rec.normal, refractionRatio);
+                }
+                // color remains white
+            }
+            ro = rec.p;
+        }
+        else {
+            // Sky
+            col *= background(rd);
+            break;
+        }
+    }
+    return col;
+}
+
+//------------------------------------------------------
+// 7) MAIN SHADERTOY ENTRY
+//------------------------------------------------------
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    // Normalized pixel coords
+    vec2 uv = fragCoord.xy / iResolution.xy;
+
+    // Camera setup
+    vec3 lookfrom = vec3(13.0, 2.0, 3.0);
+    vec3 lookat   = vec3(0.0, 0.0, 0.0);
+    vec3 vup      = vec3(0.0, 1.0, 0.0);
+    float distToFocus = 10.0;
+    float aperture    = 0.1;
+    float vfov        = 20.0;
+
+    float theta = radians(vfov);
+    float h = tan(theta * 0.5);
+    float viewportHeight = 2.0 * h;
+    float viewportWidth  = (iResolution.x / iResolution.y) * viewportHeight;
+
+    vec3 w = normalize(lookfrom - lookat);
+    vec3 u = normalize(cross(vup, w));
+    vec3 v = cross(w, u);
+
+    vec3 origin    = lookfrom;
+    vec3 horizontal = distToFocus * viewportWidth  * u;
+    vec3 vertical   = distToFocus * viewportHeight * v;
+    vec3 lowerLeftCorner = origin
+                           - 0.5*horizontal
+                           - 0.5*vertical
+                           - w * distToFocus;
+
+    // Anti-aliasing (4 samples)
+    const int SAMPLES = 4;
+    vec3 col = vec3(0.0);
+
+    // Use fragCoord + iTime for the bounce random seed
+    vec2 seed = fragCoord.xy + iTime;
+
+    for(int s = 0; s < SAMPLES; s++) {
+        float uCoord = (fragCoord.x + rnd(seed)) / iResolution.x;
+        float vCoord = (fragCoord.y + rnd(seed)) / iResolution.y;
+
+        // Depth-of-field offset
+        vec2 disk = random_in_unit_disk(seed) * (aperture * 0.5);
+        vec3 offset = u * disk.x + v * disk.y;
+
+        vec3 ro = origin + offset;
+        vec3 rdir = normalize(
+            lowerLeftCorner + uCoord * horizontal + vCoord * vertical - origin - offset
+        );
+
+        col += rayColor(ro, rdir, seed);
+    }
+
+    // Average samples & gamma correct
+    col /= float(SAMPLES);
+    col = sqrt(col);
+
+    fragColor = vec4(col, 1.0);
+}
