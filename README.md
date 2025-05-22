@@ -20,4 +20,4 @@ Instructions to run project 3 (Minecraft clone):
 
 Instructions to run project 4 (Bezier Curve Editor):
 
-[Instructions](https://github.com/salSiyab1/ComputerGraphics/blob/main/Curves/README.MD)
+[curves](https://github.com/salSiyab1/ComputerGraphics/blob/main/Curves/README.MD)
